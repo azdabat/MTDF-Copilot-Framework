@@ -1,0 +1,163 @@
+// ============================================================================
+// ROUTER RULE: LOLBin Multi-Technique Evasion Surface
+// ============================================================================
+// Architecture  : Router Rule (Architecture 2) — Triage Surface
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle     : Router (Temporary)
+// MITRE         : T1003.001 · T1562.001 · T1562.002 · T1027 · T1105 · T1218
+//
+// WHY THIS IS A ROUTER RULE AND NOT A COMPOSITE:
+// This rule covers five distinct techniques across four different noise domains.
+// Each technique requires its own suppression model:
+//   LSASS Dump     → AV/EDR process noise around LSASS access (OpenProcess rights)
+//   AMSI Bypass    → PowerShell script execution noise (every PS session touches AMSI)
+//   Defender Tamper→ Security tooling and MDM noise (Intune uses Set-MpPreference)
+//   Encoded Payload→ PowerShell admin scripting noise (encoded commands are common)
+//   Proxy Download → certutil/bitsadmin noise (SCCM/PKI — see dedicated router rules)
+// Combining these in one composite would require suppression so broad it creates
+// blind spots across all five surfaces. Each has a dedicated composite pending.
+//
+// FIXES APPLIED vs ORIGINAL (Docs 15):
+// [FIX-UNDEFINED]  LolBins variable was undefined in Rule B — merged and defined
+// [FIX-UNDEFINED]  MinRiskScore was undefined in Rule B — replaced with MinRisk
+// [FIX-SPLIT]      Two broken partial queries merged into one clean rule
+// [FIX-1]          any() replaced with arg_max(Timestamp, *) — deterministic
+// [FIX-7]          All iff() use explicit int comparisons (== 1)
+// [FIX-8]          All boolean flags wrapped in toint()
+// [FIX-THRESHOLD]  Threshold corrected to >= 30 (router rule standard)
+// [FIX-BASE]       Base starts at 0 — router rule doctrine
+// [FIX-STRUCTURE]  MTDF four-phase structure applied
+// [FIX-DIRECTIVE]  Hunter_Directive → RoutingDirective with composite targets
+// [FIX-DECOMP]     Decomposition tracker added — mandatory for router rules
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬──────────────────────────────┬─────────────────────┐
+// │ Technique            │ Composite Status              │ Action              │
+// ├──────────────────────┼──────────────────────────────┼─────────────────────┤
+// │ LSASS Dump (comsvcs) │ T1003.001 Composite — pending │ Keep in router      │
+// │ AMSI Bypass          │ T1562.002 Composite — pending │ Keep in router      │
+// │ Defender Tamper      │ T1562.001 Composite — pending │ Keep in router      │
+// │ Encoded Payload      │ T1027 Composite — pending     │ Keep in router      │
+// │ Proxy Download       │ T1197/T1140 — see router R1   │ Route to Router R1  │
+// └──────────────────────┴──────────────────────────────┴─────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+
+// ── LOLBin scope — all binaries relevant to technique surfaces ──────────────
+let LOLBins = dynamic([
+    "rundll32.exe","regsvr32.exe","mshta.exe","wmic.exe",
+    "wscript.exe","cscript.exe","certutil.exe","bitsadmin.exe",
+    "schtasks.exe","taskkill.exe","pcalua.exe","forfiles.exe",
+    "powershell.exe","pwsh.exe"
+]);
+
+// ── Technique-specific indicator sets ──────────────────────────────────────
+let Ind_LSASS    = dynamic(["comsvcs.dll","MiniDump","lsass.dmp","minidump"]);
+let Ind_AMSI     = dynamic([
+    "AmsiUtils","AmsiScanBuffer","amsiInitFailed",
+    "System.Management.Automation.AmsiUtils"
+]);
+let Ind_Encoded  = dynamic([
+    "-enc","-encodedcommand","FromBase64String",
+    "[Convert]::FromBase64String","IEX(","Invoke-Expression"
+]);
+let Ind_Defender = dynamic([
+    "Set-MpPreference","DisableRealtimeMonitoring",
+    "DisableIOAVProtection","MpCmdRun.exe -RemoveDefinitions",
+    "Add-MpPreference","ExclusionPath","ExclusionProcess"
+]);
+let Ind_Proxy    = dynamic(["-urlcache","transfer","/transfer"]);
+
+// ── Known management tooling — soft down-score, never hard exclusion ────────
+let ManagedAccounts = dynamic([
+    "system","local service","network service",
+    "ccmexec","intunemanagement","sccm","scom"
+]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+// Wide filter across all five technique surfaces
+// No minimum truth required — router casts a wide net
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where FileName in~ (LOLBins)
+| where isnotempty(ProcessCommandLine)
+| where ProcessCommandLine has_any (
+    Ind_LSASS + Ind_AMSI + Ind_Encoded + Ind_Defender + Ind_Proxy
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] All boolean flags wrapped in toint()
+| extend
+    // Technique identification — which surface fired
+    IsLSASS     = toint(ProcessCommandLine has_any (Ind_LSASS)
+                    and FileName =~ "rundll32.exe"),
+    IsAMSI      = toint(ProcessCommandLine has_any (Ind_AMSI)),
+    IsEncoded   = toint(ProcessCommandLine has_any (Ind_Encoded)),
+    IsDefTamper = toint(ProcessCommandLine has_any (Ind_Defender)),
+    IsProxy     = toint(FileName in~ ("certutil.exe","bitsadmin.exe")
+                    and ProcessCommandLine has_any (Ind_Proxy)),
+
+    // Context signals
+    IsElevated      = toint(InitiatingProcessIntegrityLevel in ("High","System")),
+    IsManagedAcct   = toint(tolower(AccountName) has_any (ManagedAccounts)),
+
+    // Masquerade check — strong signal regardless of technique
+    FileLower   = tolower(FileName),
+    OrigLower   = tolower(tostring(column_ifexists(
+                    "ProcessVersionInfoOriginalFileName",""))),
+    HasOrig     = isnotempty(tolower(tostring(column_ifexists(
+                    "ProcessVersionInfoOriginalFileName",""))))
+| extend
+    IsMasqueraded = toint(HasOrig and FileLower != OrigLower)
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)  // Renamed binary — critical
+    + iff(IsLSASS == 1,         40, 0)  // LSASS dump primitive — very high
+    + iff(IsAMSI == 1,          35, 0)  // AMSI bypass — high confidence
+    + iff(IsDefTamper == 1,     35, 0)  // Defender tamper — high confidence
+    + iff(IsEncoded == 1,       25, 0)  // Encoded payload — elevated
+    + iff(IsProxy == 1,         20, 0)  // Proxy download — see router R1
+    + iff(IsElevated == 1,      10, 0)  // Elevated context — amplifier
+    - iff(IsManagedAcct == 1,   15, 0)  // Soft: managed service account
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+// Route to the correct ecosystem composite per technique
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed LOLBin confirmed",
+    IsLSASS == 1,
+        "CRITICAL → T1003.001 LSASS Dump Composite | comsvcs/MiniDump primitive | Composite pending",
+    IsAMSI == 1,
+        "HIGH → T1562.002 AMSI Bypass Composite | Bypass primitive confirmed | Composite pending",
+    IsDefTamper == 1,
+        "HIGH → T1562.001 Defender Tamper Composite | Tamper primitive confirmed | Composite pending",
+    IsEncoded == 1,
+        "HIGH → T1027 Encoded Payload Composite | Encoded execution confirmed | Composite pending",
+    IsProxy == 1,
+        "MEDIUM → T1197/T1140 Ingress Router Rule | Proxy download — route to Router Rule 1",
+    "MEDIUM → LOLBin evasion surface | Identify technique and route to composite"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    InitiatingProcessIntegrityLevel,
+    RiskScore,
+    IsMasqueraded, IsLSASS, IsAMSI, IsEncoded,
+    IsDefTamper, IsProxy, IsElevated,
+    RoutingDirective
+| sort by RiskScore desc
