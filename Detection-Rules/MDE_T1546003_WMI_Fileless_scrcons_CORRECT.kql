@@ -1,0 +1,260 @@
+// ============================================================================
+// RULE: MDE_T1546.003_WMI_Fileless_scrcons_DLLLoad_SubstrateFirst
+// AUTHOR: Ala Dabat | MTDF Doctrine (2026)
+// MITRE: T1546.003 — Event Triggered Execution: WMI Event Subscription
+// ANCHORING STRATEGY: Substrate-First
+// SKELETON: A — Substrate-First MDE
+// TARGET: Microsoft Defender XDR — Advanced Hunting
+// STATUS: Production-Candidate (ADX validation pending)
+// ============================================================================
+//
+// PRE-FLIGHT DECLARATION
+// ─────────────────────────────────────────────────────────────────────────────
+// Technique:      T1546.003 WMI Permanent Event Subscription — Fileless variant
+//
+// Anchoring:      Substrate-First
+//                 The execution substrate carries NO visible intent at the
+//                 telemetry collection ring. The payload executes as a DLL
+//                 loaded into scrcons.exe memory.
+//                 There is NO child process.
+//                 There is NO command-line argument.
+//                 There is NO file written to disk.
+//                 The substrate IS the signal.
+//                 Intent-First fails here — there is no attacker-controlled
+//                 command line visible at the DLL load layer.
+//
+// Skeleton:       A — Substrate-First MDE
+//
+// Minimum Truth:  scrcons.exe loading vbscript.dll, jscript.dll, or scrobj.dll
+//                 This is the irreducible anchor. scrcons.exe is the
+//                 ActiveScriptEventConsumer host. When a WMI subscription
+//                 fires, scrcons.exe loads the script engine DLL and executes
+//                 the embedded payload in-process. This DLL load cannot occur
+//                 in legitimate enterprise workflows without a registered WMI
+//                 subscription — which is itself malicious in most environments.
+//
+// Table:          DeviceImageLoadEvents
+//                 NOT DeviceProcessEvents — there is no child process in the
+//                 fileless variant. Using DeviceProcessEvents misses this
+//                 technique entirely.
+//
+// Threshold:      RiskScore >= 65
+//
+// Minimum fire:   Base 55 + IsFirstSeenOnDevice 15 = 70 >= 65
+//                 Base 55 alone fires at threshold if no rarity data.
+//                 This is correct — scrcons loading a script engine DLL
+//                 has no legitimate baseline in most enterprise environments.
+//
+// Cousin rules needed (DO NOT combine into this rule):
+//   Cousin 1: scrcons.exe spawning child process (non-fileless variant)
+//             → DeviceProcessEvents, InitiatingProcessFileName =~ "scrcons.exe"
+//             → Intent-First on child command line
+//   Cousin 2: WMI subscription registry persistence anchor
+//             → DeviceRegistryEvents, __EventFilter / __EventConsumer keys
+//             → Substrate-First on subscription creation
+//   Cousin 3: COM hijacking (T1546.015) — adjacent persistence substrate
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ===== PHASE 1: MINIMUM TRUTH — SUBSTRATE EXISTENCE =====
+// scrcons.exe loading a script engine DLL is the irreducible truth.
+// No legitimate software causes this event outside of a registered
+// WMI ActiveScriptEventConsumer. This is the furthest-left telemetric
+// choke point for this technique.
+// Low-cost predicate on FileName and InitiatingProcessFileName —
+// discard the entire DeviceImageLoadEvents table except this surface.
+
+let SubstrateEvents =
+    DeviceImageLoadEvents
+    | where Timestamp > ago(24h)
+    // Minimum truth: scrcons.exe is the process loading the DLL
+    | where InitiatingProcessFileName =~ "scrcons.exe"
+    // Minimum truth: one of the three script engine DLLs is loaded
+    // vbscript.dll = VBScript engine
+    // jscript.dll  = JScript engine
+    // scrobj.dll   = Windows Script Components engine
+    | where FileName in~ ("vbscript.dll", "jscript.dll", "scrobj.dll")
+    // Noise exclusion: scrcons.exe loading script engines from System32
+    // is the expected path — loading from a non-system path is anomalous
+    // (soft exclusion via scoring below, not hard filter here)
+    ;
+
+// ===== PHASE 2: ZERO-JOIN NATIVE ENRICHMENT =====
+// Pull all available context from DeviceImageLoadEvents native fields.
+// This table carries IsSigned, Signer, and InitiatingProcess* natively.
+// No join against DeviceProcessEvents required or permitted.
+//
+// Note: InitiatingProcessSignerType values in MDE schema are:
+//   "None"         — unsigned or no signature
+//   "Microsoft"    — signed by Microsoft
+//   "Store"        — signed by Microsoft Store
+//   "Authenticode" — third-party authenticode signature
+//
+// Note: IsSigned is a boolean (True/False post Feb 2026)
+//       Use toint() for scoring arithmetic compatibility
+
+let EnrichedEvents =
+    SubstrateEvents
+    | extend
+        // Native ancestry fields from DeviceImageLoadEvents schema
+        AncestorProcess   = InitiatingProcessFileName,
+        AncestorCmdLine   = InitiatingProcessCommandLine,
+        AncestorHash      = InitiatingProcessSHA256,
+        AncestorSigner    = InitiatingProcessSignerType,
+        AncestorIntegrity = InitiatingProcessIntegrityLevel,
+        // DLL trust signals — native to DeviceImageLoadEvents
+        DLLSigner         = Signer,
+        DLLIsSigned       = toint(IsSigned),  // toint() for scoring arithmetic
+        DLLPath           = FolderPath,
+        DLLHash           = SHA256
+
+    // --- Substrate anomaly signals ---
+    | extend
+        // scrcons.exe running with non-system integrity is anomalous
+        IsLowIntegrity    = toint(AncestorIntegrity in~ ("Low", "Untrusted")),
+
+        // DLL loaded from outside System32/SysWOW64 = staging artefact
+        // Legitimate: C:\Windows\System32\vbscript.dll
+        // Suspicious: C:\Users\Public\vbscript.dll (renamed or sideloaded)
+        IsNonSystemPath   = toint(
+            DLLPath !startswith @"C:\Windows\System32" and
+            DLLPath !startswith @"C:\Windows\SysWOW64" and
+            DLLPath !startswith @"C:\Windows\WinSxS"
+        ),
+
+        // Unsigned DLL loaded by scrcons is highly anomalous
+        // Legitimate vbscript.dll and jscript.dll are always Microsoft-signed
+        IsUnsignedDLL     = toint(DLLIsSigned == 0 or DLLSigner == ""),
+
+        // scrcons.exe itself being unsigned indicates binary replacement/tampering
+        IsUnsignedScrcons = toint(AncestorSigner == "None" or AncestorSigner == "")
+    ;
+
+// ===== PHASE 3: CONVERGENCE SCORING & FILTERING =====
+// Base score 55 — scrcons loading a script engine DLL is inherently suspicious.
+// Reinforcement escalates confidence. Soft down-score for management lineage.
+// Never hard-exclude — preserve telemetry visibility for all events.
+//
+// SCORING DECISION TABLE:
+// ─────────────────────────────────────────────────────────────────
+// Signal               | Points | Rationale
+// ─────────────────────────────────────────────────────────────────
+// Base (substrate hit) |   +55  | scrcons + script DLL = substrate truth
+// IsNonSystemPath      |   +25  | DLL from writable path = staging artefact
+// IsUnsignedDLL        |   +20  | Legitimate script DLLs are always MS-signed
+// IsUnsignedScrcons    |   +20  | Tampered/replaced scrcons.exe binary
+// IsLowIntegrity       |   +10  | Low integrity context = restricted/exploited
+// Management lineage   |   -20  | SCCM/Intune lineage reduces urgency
+// ─────────────────────────────────────────────────────────────────
+// Minimum fire path:   55 (base) = 55 >= 65? No — base alone is 55.
+// With any one signal: 55 + 10 (IsLowIntegrity) = 65 >= 65. Fires.
+// Clean baseline:      55 < 65 — does not fire without reinforcement.
+// This is intentional. scrcons loading System32 DLLs with Microsoft
+// signature and normal integrity is the rare legitimate case.
+// A single anomaly (low integrity, non-system path, or unsigned) tips it.
+
+EnrichedEvents
+| extend RiskScore = 55
+
+// Substrate anomaly scoring
+| extend RiskScore = RiskScore + iff(IsNonSystemPath    == 1, 25, 0)
+| extend RiskScore = RiskScore + iff(IsUnsignedDLL      == 1, 20, 0)
+| extend RiskScore = RiskScore + iff(IsUnsignedScrcons  == 1, 20, 0)
+| extend RiskScore = RiskScore + iff(IsLowIntegrity     == 1, 10, 0)
+
+// Soft down-score: known management tooling in ancestry
+// Preserves telemetry row — analyst still sees the event
+| extend RiskScore = RiskScore - iff(
+    AncestorCmdLine has_any ("ccmexec.exe", "trustedinstaller.exe"),
+    20, 0)
+
+// Floor at 0 — negative scores have no semantic meaning
+| extend RiskScore = iif(RiskScore < 0, 0, RiskScore)
+
+| where RiskScore >= 65
+
+| extend Severity = case(
+    RiskScore >= 100, "CRITICAL",
+    RiskScore >= 80,  "HIGH",
+                      "MEDIUM"
+)
+
+// ===== PHASE 4: HUNTER DIRECTIVE OUTPUT =====
+// WHY:  scrcons.exe (WMI ActiveScriptEventConsumer host) loaded a script
+//       engine DLL — the irreducible substrate truth for fileless WMI execution
+// WHAT: Reinforcement signals indicating anomalous context
+// NEXT: Specific pivot chain to recover the embedded WMI subscription payload
+
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    // Core substrate evidence
+    ScriptEngineDLL   = FileName,
+    DLLPath,
+    DLLHash,
+    DLLSigner,
+    DLLIsSigned,
+    // Ancestry context
+    AncestorProcess,
+    AncestorCmdLine,
+    AncestorHash,
+    AncestorSigner,
+    AncestorIntegrity,
+    // Anomaly signals
+    IsNonSystemPath,
+    IsUnsignedDLL,
+    IsUnsignedScrcons,
+    IsLowIntegrity,
+    // Scoring
+    RiskScore,
+    Severity,
+    HunterDirective = strcat(
+        "SUBSTRATE-FIRST | T1546.003 WMI Fileless | ",
+        "Minimum Truth: scrcons.exe loaded ", FileName,
+        " from ", DLLPath, " | ",
+        "Signals: ",
+        iff(IsNonSystemPath   == 1, "NON_SYSTEM_PATH ", ""),
+        iff(IsUnsignedDLL     == 1, "UNSIGNED_DLL ", ""),
+        iff(IsUnsignedScrcons == 1, "UNSIGNED_SCRCONS ", ""),
+        iff(IsLowIntegrity    == 1, "LOW_INTEGRITY ", ""),
+        "| Score: ", tostring(RiskScore), " | Severity: ", Severity, " | ",
+        // Three-step pivot chain to recover the payload
+        "NEXT STEP 1: Pivot DeviceRegistryEvents on DeviceName=", DeviceName,
+        " — search RegistryKey has '__EventConsumer' or 'ActiveScriptEventConsumer' ",
+        "within Timestamp ±30min to recover the embedded VBScript/JScript payload. ",
+        "NEXT STEP 2: Pivot DeviceProcessEvents on DeviceName=", DeviceName,
+        " where InitiatingProcessFileName =~ 'WmiPrvSE.exe' and FileName =~ 'scrcons.exe' ",
+        "to confirm subscription activation timestamp. ",
+        "NEXT STEP 3: Run the WMI Subscription persistence cousin rule — ",
+        "check DeviceRegistryEvents for __EventFilter + __FilterToConsumerBinding ",
+        "creation events to map the full subscription chain."
+    )
+| sort by RiskScore desc, Timestamp desc
+
+// ============================================================================
+// COUSIN RULES REQUIRED (build separately — do not merge into this rule):
+//
+// COUSIN 1 — T1546.003 Non-Fileless Variant (scrcons child spawn)
+//   Table: DeviceProcessEvents
+//   Phase 1: InitiatingProcessFileName =~ "scrcons.exe"
+//   Anchoring: Intent-First on child process command line
+//   Skeleton: B
+//   Why separate: Different telemetry surface, different noise domain.
+//   This cousin catches operators who use scrcons to spawn LOLBins rather
+//   than loading the payload as a DLL. Noisy — requires strict intent anchor.
+//
+// COUSIN 2 — T1546.003 WMI Subscription Registry Persistence Anchor
+//   Table: DeviceRegistryEvents
+//   Phase 1: RegistryKey has "__EventConsumer" or "ActiveScriptEventConsumer"
+//   Anchoring: Substrate-First on subscription creation
+//   Skeleton: A
+//   Why separate: Catches the subscription CREATION (before execution).
+//   This is the Day 0 staging primitive. The DLL load rule catches Day N
+//   execution. Together they defeat temporal deception.
+//
+// COUSIN 3 — T1546.015 COM Hijacking (adjacent persistence substrate)
+//   Table: DeviceRegistryEvents
+//   Phase 1: RegistryKey has "HKCU\Software\Classes\CLSID"
+//   Anchoring: Substrate-First
+//   Skeleton: A
+// ============================================================================
