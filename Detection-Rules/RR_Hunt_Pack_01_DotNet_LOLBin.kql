@@ -1,0 +1,151 @@
+// ============================================================================
+// ROUTER RULE: .NET Build/Compile LOLBin Execution (Hunt Pack 01/10)
+// ============================================================================
+// Architecture  : Router Rule (Architecture 2) — Triage Surface
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle     : Router (Temporary)
+// MITRE         : T1127 · T1218.004 · T1218.009 · T1059
+//
+// WHY THIS IS A ROUTER RULE:
+// Three .NET tool families — three incompatible noise domains.
+// msbuild/csc/csi = developer build pipeline noise — HIGH enterprise baseline.
+//   Suppression: exclude known CI/CD accounts, build agent service accounts.
+// installutil/regasm = software deployment noise — different context entirely.
+//   Suppression: exclude software deployment accounts + signed publisher.
+// ieexec/pcwrun = almost never legitimately used — very LOW baseline.
+//   Suppression: minimal — near-universal suspicion when these fire.
+// Suppressing developer build pipeline noise blinds detection of installutil
+// abuse. These require separate composites with separate suppression models.
+//
+// FIXES vs ORIGINAL Hunt Pack 01:
+// [FIX-1]         any(SampleCLI) → arg_max(Timestamp, *)
+// [FIX-7]         All iff() use explicit int comparisons (== 1)
+// [FIX-8]         IsMasqueraded, IsDevTool, IsDeployTool, IsLowNoiseTool,
+//                 PcwRunBroker, HasNet, IsIEExecRemote, HasScript, BadDLLPath,
+//                 BadParent, IsBuildAccount all toint()
+// [FIX-BURST]     where not(Count > 20 and MaxRisk < 70) removed.
+//                 Replaced with IsBuildAccount soft down-score penalty.
+// [FIX-THRESHOLD] >= 50 → >= 30 (correct router threshold)
+// [FIX-DEADCODE]  WeirdExport=bool(false), IsPersistence=bool(false) removed.
+// [FIX-BASE]      Base = 0 explicitly (was implicit in original)
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬──────────────────────────────┬─────────────────────┐
+// │ Technique            │ Composite Status              │ Action              │
+// ├──────────────────────┼──────────────────────────────┼─────────────────────┤
+// │ msbuild inline C#    │ T1127.001 — pending 🔴        │ Keep in router      │
+// │ csc.exe compile      │ T1027/T1059 — pending 🔴      │ Keep in router      │
+// │ installutil proxy    │ T1218.004 — pending 🔴        │ Keep in router      │
+// │ regasm proxy         │ T1218.009 — pending 🔴        │ Keep in router      │
+// │ ieexec remote exec   │ T1218 variant — pending 🔴    │ Keep in router      │
+// │ pcwrun broker (-s)   │ T1218 variant — pending 🔴    │ Keep in router      │
+// └──────────────────────┴──────────────────────────────┴─────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let DevTools = dynamic(["msbuild.exe","csc.exe","csi.exe"]);
+let DeployTools = dynamic(["installutil.exe","regasm.exe"]);
+let LowNoiseTools = dynamic(["ieexec.exe","pcwrun.exe"]);
+let AllTargetProcs = dynamic([
+    "msbuild.exe","csc.exe","csi.exe",
+    "ieexec.exe","installutil.exe","regasm.exe","pcwrun.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe","mshta.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+let KnownBuildAccounts = dynamic([
+    "build","ci","devops","jenkins","github","runner"
+]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (AllTargetProcs) or (HasOrig and OrigLower in~ (AllTargetProcs))
+| where ProcessCommandLine has_any (
+    ".csproj",".vbproj",".proj",".targets","/t:","/p:",
+    "-target:","-reference:","-r:","/unsafe","-out:",
+    ".csx","-script",
+    ".application",".manifest",
+    "/u","uninstall","/logfile=","/logtoconsole","codebase","/tlb",
+    " -s ",
+    "http://","https://"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] toint() on all boolean flags
+| extend
+    IsMasqueraded  = toint(HasOrig and FileLower != OrigLower),
+    IsDevTool      = toint(FileLower in~ (DevTools) or OrigLower in~ (DevTools)),
+    IsDeployTool   = toint(FileLower in~ (DeployTools) or OrigLower in~ (DeployTools)),
+    IsLowNoiseTool = toint(FileLower in~ (LowNoiseTools) or OrigLower in~ (LowNoiseTools)),
+    PcwRunBroker   = toint((FileLower == "pcwrun.exe" or OrigLower == "pcwrun.exe")
+                        and ProcessCommandLine has " -s "),
+    HasNet         = toint(ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    IsIEExecRemote = toint((FileLower == "ieexec.exe" or OrigLower == "ieexec.exe")
+                        and ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    HasScript      = toint(ProcessCommandLine has_any (
+                        "-enc","frombase64string","iex","downloadstring")),
+    BadDLLPath     = toint((ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl")
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    BadParent      = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    IsBuildAccount = toint(AccountName has_any (KnownBuildAccounts))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)
+    + iff(PcwRunBroker == 1,    45, 0)
+    + iff(IsIEExecRemote == 1,  40, 0)
+    + iff(HasNet == 1,          30, 0)
+    + iff(HasScript == 1,       25, 0)
+    + iff(BadDLLPath == 1,      20, 0)
+    + iff(BadParent == 1,       15, 0)
+    + iff(IsDeployTool == 1,    10, 0)
+    - iff(IsDevTool == 1 and IsBuildAccount == 1, 20, 0)
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed .NET binary confirmed",
+    PcwRunBroker == 1,
+        "CRITICAL → T1218 PCWRun Composite | Execution broker -s flag | Pending composite",
+    IsIEExecRemote == 1,
+        "CRITICAL → T1218 ieexec Remote Exec | Remote URL execution | Pending composite",
+    HasNet == 1 and IsDeployTool == 1,
+        "HIGH → T1218.004/T1218.009 Deploy Tool Proxy | Remote exec via installutil/regasm",
+    HasNet == 1,
+        "HIGH → T1127 MSBuild/CSC Remote | Remote resource in build tool",
+    HasScript == 1,
+        "HIGH → T1059 Encoded Exec | Script primitive in .NET toolchain",
+    BadParent == 1,
+        "MEDIUM → .NET toolchain from suspicious parent | Pivot to parent process",
+    "MEDIUM → .NET toolchain activity | Review context and build environment"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, PcwRunBroker, IsIEExecRemote,
+    HasNet, HasScript, BadParent, RoutingDirective
+| sort by RiskScore desc
