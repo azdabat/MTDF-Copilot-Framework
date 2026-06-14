@@ -1,0 +1,165 @@
+// ============================================================================
+// ROUTER RULE: Script Proxy Execution Surface (Hunt Pack 02/10)
+// ============================================================================
+// Architecture  : Router Rule (Architecture 2) — Triage Surface
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle     : Router (Temporary)
+// MITRE         : T1218.005 · T1218.010 · T1218.011 · T1059.005 · T1216.001
+//
+// WHY THIS IS A ROUTER RULE:
+// Six script proxy binaries — three incompatible noise domains.
+// wscript/cscript = enterprise automation scripts — VERY HIGH noise.
+//   Suppression: exclude known automation service accounts + script paths.
+// rundll32 = COM activation, print spooler, shell ops — HIGH system noise.
+//   Suppression: exclude known-good parents (spoolsv, dllhost, svchost).
+// mshta/regsvr32 = legacy HTA apps, COM registration — MODERATE noise.
+//   Suppression: exclude known HTA paths, signed installer parent.
+// Suppressing wscript/cscript legitimate enterprise automation would create
+// blind spots in rundll32 and mshta detection which have different noise.
+// Note: rundll32/regsvr32/mshta could become a composite pack once noise
+// calibration confirms their suppression models are truly compatible.
+// wscript/cscript should remain in a separate router or composite.
+//
+// FIXES vs ORIGINAL Hunt Pack 02:
+// [FIX-1]         any(SampleCLI) → arg_max(Timestamp, *)
+// [FIX-7]         All iff() use explicit int comparisons (== 1)
+// [FIX-8]         IsMasqueraded, IsRundll32, IsRegsvr32, IsMshta, IsWScript,
+//                 HasNet, HasScript, BadDLLPath, WeirdExport, BadParent,
+//                 IsRemoteProxy, IsKnownSafeParent all toint()
+// [FIX-BURST]     where not(Count > 20 and MaxRisk < 70) removed.
+//                 Replaced with IsKnownSafeParent per-binary soft penalty.
+// [FIX-THRESHOLD] >= 50 → >= 30 (correct router threshold)
+// [FIX-DEADCODE]  IsPersistence=bool(false) removed.
+// [FIX-CIRCULAR]  IsDownloader was just re-evaluating HasNet.
+//                 Replaced with IsRemoteProxy — mshta/regsvr32 + HasNet —
+//                 a specific high-risk combination, not a duplicate.
+// [FIX-BASE]      Base = 0 explicitly stated
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬──────────────────────────────┬─────────────────────┐
+// │ Technique            │ Composite Status              │ Action              │
+// ├──────────────────────┼──────────────────────────────┼─────────────────────┤
+// │ mshta proxy exec     │ T1218.005 — pending 🔴        │ Keep in router      │
+// │ regsvr32 squiblydoo  │ T1218.010 — pending 🔴        │ Keep in router      │
+// │ rundll32 proxy       │ T1218.011 — COMPOSITE BUILT   │ Route to composite  │
+// │ wscript/cscript      │ T1059.005 — pending 🔴        │ Keep in router      │
+// │ odbcconf SQLODBC     │ T1218.008 — pending 🔴        │ Keep in router      │
+// │ control.exe CPL      │ T1218.002 — pending 🔴        │ Keep in router      │
+// └──────────────────────┴──────────────────────────────┴─────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let TargetProcs = dynamic([
+    "mshta.exe","regsvr32.exe","rundll32.exe",
+    "wscript.exe","cscript.exe","odbcconf.exe","control.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe",
+    "winword.exe","excel.exe","outlook.exe","powerpnt.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+let SafeRundll32Parents = dynamic(["spoolsv.exe","dllhost.exe","svchost.exe"]);
+let SafeRegsvr32Parents = dynamic(["msiexec.exe","setup.exe","install.exe"]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "javascript","vbscript","scrobj","hta",
+    ".sct",".js",".jse",".vbs",".vbe",".wsf",
+    ".dll",".cpl",
+    "DllRegisterServer","regsvr",
+    "\\Users\\Public","\\ProgramData","\\Temp","\\AppData"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] toint() on all boolean flags
+| extend
+    IsMasqueraded     = toint(HasOrig and FileLower != OrigLower),
+    IsRundll32        = toint(FileLower == "rundll32.exe" or OrigLower == "rundll32.exe"),
+    IsRegsvr32        = toint(FileLower == "regsvr32.exe" or OrigLower == "regsvr32.exe"),
+    IsMshta           = toint(FileLower == "mshta.exe"    or OrigLower == "mshta.exe"),
+    IsWScript         = toint(FileLower in~ ("wscript.exe","cscript.exe")
+                            or OrigLower in~ ("wscript.exe","cscript.exe")),
+    HasNet            = toint(ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    HasScript         = toint(ProcessCommandLine has_any (
+                            "scrobj.dll","javascript:","vbscript:",
+                            "wscript.shell",".sct",".wsf")),
+    BadDLLPath        = toint((ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl")
+                            and ProcessCommandLine has_any (SuspiciousDirs)),
+    WeirdExport       = toint(
+                            (FileLower == "rundll32.exe" or OrigLower == "rundll32.exe")
+                            and ProcessCommandLine matches regex
+                            @"(?i),(#\d+|run|start|dllregisterserver|entry|main|shellexec_rundll)"),
+    BadParent         = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    // [FIX-CIRCULAR] IsRemoteProxy replaces IsDownloader = HasNet
+    // mshta/regsvr32 + remote URL is a specific high-risk combination
+    IsRemoteProxy     = toint(
+                            HasNet == 1
+                            and (FileLower in~ ("mshta.exe","regsvr32.exe")
+                                 or OrigLower in~ ("mshta.exe","regsvr32.exe"))),
+    IsKnownSafeParent = toint(
+                            (IsRundll32 == 1
+                                and InitiatingProcessFileName in~ (SafeRundll32Parents))
+                            or (IsRegsvr32 == 1
+                                and InitiatingProcessFileName in~ (SafeRegsvr32Parents)))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,     50, 0)
+    + iff(IsRemoteProxy == 1,     35, 0)
+    + iff(HasNet == 1,            25, 0)
+    + iff(HasScript == 1,         25, 0)
+    + iff(WeirdExport == 1,       20, 0)
+    + iff(BadDLLPath == 1,        20, 0)
+    + iff(BadParent == 1,         15, 0)
+    - iff(IsKnownSafeParent == 1, 20, 0)
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed script proxy binary confirmed",
+    IsRegsvr32 == 1 and HasScript == 1,
+        "CRITICAL → T1218.010 regsvr32 Squiblydoo | Scriptlet execution | Pending composite",
+    IsMshta == 1 and HasNet == 1,
+        "HIGH → T1218.005 mshta Proxy | Remote HTA execution | Pending composite",
+    IsRundll32 == 1 and (HasNet == 1 or WeirdExport == 1),
+        "HIGH → T1218.011 rundll32 Composite | COMPOSITE BUILT — run it now",
+    IsRegsvr32 == 1 and HasNet == 1,
+        "HIGH → T1218.010 regsvr32 Remote | Remote scriptlet | Pending composite",
+    BadParent == 1,
+        "HIGH → Script proxy from Office/shell parent | Pivot to parent timeline",
+    BadDLLPath == 1,
+        "MEDIUM → DLL/CPL from staging path | Investigate binary and source",
+    "MEDIUM → Script proxy surface | Review command line and parent"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, IsRundll32, IsRegsvr32,
+    IsMshta, HasNet, HasScript, WeirdExport, BadParent,
+    RoutingDirective
+| sort by RiskScore desc
