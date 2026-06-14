@@ -1,0 +1,77 @@
+// ============================================================================
+// THREAT INTEL SENSOR: Tor Exit Node Connection Detection
+// ============================================================================
+// Architecture  : Threat Intel Match — NOT a router rule, NOT a composite
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceNetworkEvents
+// Lifecycle     : Always-on (dependent on external intel feed)
+// MITRE         : T1090 Proxy · T1071 Application Layer Protocol
+//                 T1573 Encrypted Channel
+//
+// WHY THIS IS NEITHER A ROUTER RULE NOR A COMPOSITE:
+// A threat intel match is a third architectural category in the MTDF estate.
+// The anchor IS external data — confirmed malicious infrastructure.
+// There is no noise domain question because any confirmed connection to a
+// known Tor exit node warrants investigation regardless of process context.
+// No threshold is required — every hit is a finding.
+// The appropriate analyst action is investigation, not routing to a composite.
+//
+// FIXES vs ORIGINAL:
+// [FIX-1]         make_set(Cmds) — commands capped at 10 with length limit
+//                 to prevent oversized dynamic columns in output.
+// [FIX-CLOSING]   Missing closing ) on pack_array in original — syntax error.
+// [FIX-DIRECTIVE] HuntingDirectives → structured IntelDirective field
+//                 consistent with MTDF output format.
+// [FIX-MAKE_SET]  All make_set() calls given explicit size limits.
+// ============================================================================
+
+let lookback = 7d;
+let TorExitNodes = externaldata(dest_ip: string)
+    ["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/TOR/only_tor_exit_nodes_IP_list.csv"]
+    with (format="csv", ignoreFirstRecord=true);
+let TorIPs = TorExitNodes | distinct dest_ip;
+
+// ── SURFACE FILTER ──────────────────────────────────────────────────────────
+// No threshold — every Tor exit node connection is a finding
+DeviceNetworkEvents
+| where Timestamp > ago(lookback)
+| where RemoteIP in (TorIPs)
+
+// ── ENRICHMENT ──────────────────────────────────────────────────────────────
+| extend
+    Direction = iif(ActionType == "ConnectionSuccess", "Outbound to Tor", "Connection to Tor"),
+    VT_Link   = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+
+// ── AGGREGATION ─────────────────────────────────────────────────────────────
+// [FIX-1] All make_set() calls capped with size and length limits
+| summarize
+    FirstSeen  = min(Timestamp),
+    LastSeen   = max(Timestamp),
+    Count      = count(),
+    Processes  = make_set(InitiatingProcessFileName, 20),
+    Cmds       = make_set(substring(InitiatingProcessCommandLine, 0,
+                    min(strlen(InitiatingProcessCommandLine), 200)), 10),
+    Accounts   = make_set(InitiatingProcessAccountName, 10),
+    Ports      = make_set(RemotePort, 20)
+  by DeviceName, RemoteIP, Direction, VT_Link
+
+// ── INTEL DIRECTIVE ─────────────────────────────────────────────────────────
+| extend IntelDirective = strcat(
+    "TOR EXIT NODE | ",
+    "Device: ", DeviceName, " | ",
+    "Direction: ", Direction, " | ",
+    "Connections: ", tostring(Count), " | ",
+    "Processes: ", tostring(Processes), " | ",
+    "NEXT: Confirm Tor is not sanctioned for this user/team. | ",
+    "NEXT: Pivot on process hashes across estate. | ",
+    "NEXT: Review DeviceLogonEvents ±2h around FirstSeen. | ",
+    "NEXT: VT: ", VT_Link
+)
+| extend MITRE =
+    "T1090 Proxy · T1071 Application Layer Protocol · T1573 Encrypted Channel"
+
+| project
+    FirstSeen, LastSeen, DeviceName, RemoteIP,
+    Direction, Count, Processes, Cmds,
+    Accounts, Ports, MITRE, IntelDirective
+| sort by Count desc
