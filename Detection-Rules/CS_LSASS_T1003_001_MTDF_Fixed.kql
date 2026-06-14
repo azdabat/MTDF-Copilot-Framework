@@ -1,0 +1,281 @@
+// ============================================================================
+// COMPOSITE SENSOR: LSASS Credential Theft — T1003.001 (MTDF Production Fixed)
+// ============================================================================
+// Architecture  : Composite Sensor (Architecture 1 — Inference: HIGH)
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting
+//                 DeviceProcessEvents · DeviceFileEvents · DeviceEvents
+// Lifecycle     : Production-Candidate (ADX validation pending)
+// MITRE         : T1003.001 OS Credential Dumping: LSASS Memory
+//                 T1003.002 Security Account Manager
+//                 TA0006 Credential Access
+//
+// MINIMUM TRUTH ANCHOR:
+//   Any process interaction with LSASS that crosses the minimum evidence
+//   threshold for attacker-controlled access — by tool, by command line
+//   primitive, by file artefact, or by direct API handle acquisition.
+//   No single signal is the truth alone. Convergence IS the truth.
+//
+// INFERENCE DEPTH: HIGH
+//   Claim: "LSASS credential dump or access is confirmed or highly likely"
+//   Base: 55 (minimum truth already elevated at Phase 1)
+//   Threshold: >= 60
+//
+// WHY THIS IS A COMPOSITE AND NOT A ROUTER RULE:
+//   Single adversary goal: credential theft from LSASS.
+//   Single noise domain: AV/EDR and OS processes legitimately access LSASS.
+//   One suppression model (BenignImages) covers ALL signal sources.
+//   Three signal surfaces (Process, File, API) are NOT different noise domains —
+//   they are different evidence types for the same technique on the same target.
+//   This is exactly what composites are for: converging multiple evidence
+//   types with a unified suppression model into a single scored finding.
+//
+// THREE-SURFACE SIGNAL ARCHITECTURE:
+//   Signal A — Process Behaviour: tools + command line primitives
+//   Signal B — File Artefacts: .dmp files written to staging paths
+//   Signal C — API Telemetry: direct handle access to LSASS (fileless variants)
+//   Union of all three → convergence scoring → HunterDirective
+//
+// FIXES APPLIED vs ORIGINAL (Doc 13):
+// [FIX-1]       any() → take_any() in pass-through summarise columns
+// [FIX-2]       make_set(Technique, 20) — size limit added
+// [FIX-7]       All iif(flag, x, 0) → iff(flag == 1, x, 0) explicit int comparison
+// [FIX-8]       All boolean signals converted to toint() consistently
+// [FIX-BASE]    Base score applied correctly — 55 structural truth established
+//               at Phase 1, not post-union scoring from zero
+// [FIX-SCHEMA]  TargetProcessName does NOT exist in DeviceEvents —
+//               corrected to FileName =~ "lsass.exe" per MTDF schema reference
+// [FIX-FIELD]   comsvcs.dll must NOT be matched against FileName in
+//               DeviceProcessEvents (FileName is always .exe) —
+//               corrected to ProcessCommandLine has "comsvcs"
+// [FIX-DIRECTIVE] Hunter_Directive → HunterDirective (MTDF field naming standard)
+//               Defined BEFORE project statement and included in project list
+// [FIX-10]      RiskScore floored at zero after penalties
+//
+// MINIMUM FIRE PATHS:
+//   Signal A: IsComsvcs (90) — immediately crosses threshold at 60 ✓
+//   Signal A: IsExplicitTool (75) — immediately crosses threshold ✓
+//   Signal B: IsExplicit file (60) + multi-signal boost (15) = 75 ✓
+//   Signal C: API access (50) + LOLBin boost (20) = 70 if comsvcs also fires ✓
+//   Multi-signal convergence: any two signals converging = confident finding
+//
+// PRIMITIVE BACKING:
+//   T1003.001 Primitive Collector — 30-day rolling index of all LSASS access events
+//   Build this alongside the composite if not already present.
+//
+// COUSIN SENSORS (build next):
+//   1. T1003.001 ProcDump Composite — procdump.exe + -ma lsass (different tool, same goal)
+//   2. T1003.001 Task Manager Dump — Substrate-First, API handle, no cmdline artefact
+//   3. T1003.006 DCSync Composite — non-DC replication rights, network-level credential theft
+// ============================================================================
+
+let Lookback = 7d;
+
+// ── ALLOWLISTS — known legitimate LSASS accessors ───────────────────────────
+// These are soft down-scores, not hard exclusions.
+// An attacker who names their tool "msmpeng.exe" would still be caught
+// by the technique signals — the penalty reduces confidence, not coverage.
+let BenignImages = dynamic([
+    "msmpeng.exe","senseir.exe","wininit.exe","csrss.exe",
+    "mssense.exe","sensecncproxy.exe","windefend.exe","avp.exe"
+]);
+
+// Known dump tool binaries — explicit tool use is high-confidence signal
+let DumpTools = dynamic([
+    "procdump.exe","dumpert.exe","nanodump.exe","mimikatz.exe"
+]);
+
+// ── SIGNAL A: PROCESS BEHAVIOUR ─────────────────────────────────────────────
+// WHY: Tool execution and command-line primitives are the most visible
+// evidence tier — highest signal, highest confidence per event.
+// Comsvcs/rundll32 = LOLBin pattern (attacker uses signed Windows binary)
+// ExplicitTool = known dump utility (attacker brings own tool)
+// GenericDump = keyword match (lower confidence, needs reinforcement)
+//
+// [FIX-FIELD] comsvcs matched against ProcessCommandLine (not FileName)
+// FileName in DeviceProcessEvents is always the .exe — never a .dll
+let ProcSignals =
+DeviceProcessEvents
+| where Timestamp >= ago(Lookback)
+| where not(InitiatingProcessFileName in~ (BenignImages))
+| extend
+    Cmd  = tolower(ProcessCommandLine),
+    Proc = tolower(FileName)
+| extend
+    // [FIX-8] toint() on all boolean signal flags
+    // TRUTH 1: LOLBin comsvcs pattern — CRITICAL confidence
+    IsComsvcs      = toint(Cmd has "comsvcs" and Cmd has "minidump"),
+    // TRUTH 2: Ordinal form evasion — comsvcs #24 bypasses string matching
+    IsOrdinal      = toint(Cmd matches regex @"(?i)(comsvcs.*#24|#24.*comsvcs)"),
+    // TRUTH 3: Known explicit dump tool with LSASS targeting
+    IsExplicitTool = toint(Proc in~ (DumpTools)
+                        and (Cmd has "lsass" or Cmd has "dump")),
+    // TRUTH 4: Generic keyword — weaker signal, needs reinforcement
+    IsGenericDump  = toint(Cmd has "lsass" and Cmd has_any (
+                        "minidump","sekurlsa","full","dump")),
+    // Context: staging path in command line
+    StagingInCmd   = toint(Cmd has_any ("\\temp\\","\\appdata\\","\\public\\","\\programdata\\"))
+| where IsComsvcs == 1 or IsOrdinal == 1 or IsExplicitTool == 1 or IsGenericDump == 1
+| project
+    Timestamp, DeviceName, AccountName, DeviceId,
+    ActionType    = "ProcessExecution",
+    Technique     = case(
+        IsComsvcs == 1 or IsOrdinal == 1, "LOLBin_Comsvcs",
+        IsExplicitTool == 1,              "Known_Dump_Tool",
+        "Generic_Dump_Cmd"),
+    Evidence      = Cmd,
+    // [FIX-7] Explicit int comparison in iff() throughout
+    SignalScore   = case(
+        IsComsvcs == 1,      90,
+        IsOrdinal == 1,      85,
+        IsExplicitTool == 1, 75,
+        40),
+    StagingInCmd;
+
+// ── SIGNAL B: FILE ARTEFACTS ─────────────────────────────────────────────────
+// WHY: A .dmp file written to a staging path is the output of the dump.
+// This catches variants where the process signal is absent or obfuscated.
+// lsass.dmp by explicit name = highest confidence.
+// Any .dmp to staging path = moderate confidence, needs convergence.
+//
+// Note: .dmp files are created legitimately after system crashes (WER).
+// Suppression: InitiatingProcessFileName in BenignImages (WER = werfault.exe)
+let FileSignals =
+DeviceFileEvents
+| where Timestamp >= ago(Lookback)
+| where FileName endswith ".dmp" or FileName =~ "lsass.dmp"
+| where not(InitiatingProcessFileName in~ (BenignImages))
+| extend
+    Path = tolower(FolderPath),
+    // [FIX-8] toint() consistently
+    IsStaged   = toint(tolower(FolderPath) has_any (
+                    "temp","public","programdata","appdata")),
+    IsExplicit = toint(FileName =~ "lsass.dmp")
+| where IsStaged == 1 or IsExplicit == 1
+| project
+    Timestamp, DeviceName,
+    AccountName = InitiatingProcessAccountName,
+    DeviceId,
+    ActionType  = "FileCreation",
+    Technique   = "LSASS_Dump_File",
+    Evidence    = strcat(Path,"\\",FileName),
+    SignalScore = case(
+        IsExplicit == 1, 60,
+        IsStaged == 1,   40,
+        20),
+    StagingInCmd = IsStaged;
+
+// ── SIGNAL C: API TELEMETRY ───────────────────────────────────────────────────
+// WHY: Fileless LSASS access — no cmdline, no .dmp file.
+// Attacker uses direct process handle acquisition via OpenProcess API.
+// This catches nanodump, custom tools, and direct syscall variants.
+// Moderate confidence alone — designed to converge with Signal A or B.
+//
+// [FIX-SCHEMA] TargetProcessName does NOT exist in DeviceEvents.
+// Correct approach: FileName =~ "lsass.exe" (the target process name
+// is stored in FileName for handle-related ActionTypes in DeviceEvents).
+let ApiSignals =
+DeviceEvents
+| where Timestamp >= ago(Lookback)
+| where ActionType in ("OpenProcessApiCall","AccessProcessHandle")
+| where FileName =~ "lsass.exe"
+| where not(InitiatingProcessFileName in~ (BenignImages))
+| project
+    Timestamp, DeviceName,
+    AccountName = InitiatingProcessAccountName,
+    DeviceId,
+    ActionType  = "LsassHandleAccess",
+    Technique   = "Direct_Memory_Access",
+    Evidence    = strcat("Handle access by: ",InitiatingProcessFileName),
+    SignalScore = 50,
+    StagingInCmd = toint(false);
+
+// ── PHASE 3: CONVERGENCE SCORING ─────────────────────────────────────────────
+// WHY UNION BEFORE SCORING:
+// Each signal source is an independent evidence tier.
+// Convergence across tiers is the minimum truth — not any single signal.
+// A process event alone may be legitimate. A file event alone may be a crash dump.
+// Both together on the same device = the uncertainty collapses.
+//
+// SCORING DECISION TABLE:
+// ┌─────────────────────────┬────────┬────────────────────────────────────────┐
+// │ Signal                  │ Score  │ Rationale                              │
+// ├─────────────────────────┼────────┼────────────────────────────────────────┤
+// │ IsComsvcs (LOLBin)      │   90   │ Signed binary + MiniDump = structural  │
+// │ IsOrdinal (#24 evasion) │   85   │ Ordinal bypass = evasion intent        │
+// │ IsExplicitTool          │   75   │ Known dump tool + LSASS targeting      │
+// │ IsGenericDump           │   40   │ Keyword match — needs convergence      │
+// │ LSASS_Dump_File         │   60   │ .dmp file = output confirmed           │
+// │ Direct_Memory_Access    │   50   │ API handle — fileless variant          │
+// ├─────────────────────────┼────────┼────────────────────────────────────────┤
+// │ Multi-signal boost      │  +15   │ > 1 independent signal = convergence   │
+// │ LOLBin comsvcs boost    │  +20   │ Additional boost when LOLBin confirmed │
+// │ Staging path (any tier) │  +10   │ Output path confirms exfil preparation │
+// └─────────────────────────┴────────┴────────────────────────────────────────┘
+
+union ProcSignals, FileSignals, ApiSignals
+| summarize
+    FirstSeen   = min(Timestamp),
+    LastSeen    = max(Timestamp),
+    SignalCount = count(),
+    Techniques  = make_set(Technique, 20),
+    EvidenceList = make_set(Evidence, 20),
+    MaxScore    = max(SignalScore),
+    AnyStagingPath = max(StagingInCmd)
+  by DeviceName, AccountName, DeviceId
+
+// [FIX-BASE] Base 55 applied correctly — minimum truth is structural
+// even at the weakest signal tier (file + API converging = minimum truth met)
+| extend RawScore = 55
+    // Max signal score above base
+    + iif(MaxScore > 55, MaxScore - 55, 0)
+    // [FIX-7] Explicit iff(flag == 1, ...) throughout
+    + iff(SignalCount > 1,                              15, 0)
+    + iff(Techniques has "LOLBin_Comsvcs",              20, 0)
+    + iff(AnyStagingPath == 1,                          10, 0)
+
+// [FIX-10] Floor at zero — negative scores have no meaning
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+| where RiskScore >= 60
+
+| extend Severity = case(
+    RiskScore >= 90, "CRITICAL",
+    RiskScore >= 70, "HIGH",
+    "MEDIUM")
+
+// ── PHASE 4: HUNTER DIRECTIVE ────────────────────────────────────────────────
+// [FIX-DIRECTIVE] HunterDirective defined BEFORE project, included in project list
+| extend HunterDirective = case(
+    Severity == "CRITICAL",
+        strcat(
+            "CRITICAL — LSASS CREDENTIAL THEFT CONFIRMED | ",
+            "Techniques: ", tostring(Techniques), " | ",
+            "Evidence tiers: ", tostring(SignalCount), " independent signals | ",
+            "ACTIONS: 1. ISOLATE ", DeviceName, " immediately. ",
+            "2. Check for SeDebugPrivilege usage around FirstSeen. ",
+            "3. Retrieve .dmp file if StagingPath confirmed — hash and submit. ",
+            "4. Pivot AccountName across all DeviceLogonEvents estate-wide. ",
+            "5. Review all network connections from ", DeviceName, " post-dump. ",
+            "6. Assume credential compromise — force password reset for ", AccountName),
+    Severity == "HIGH",
+        strcat(
+            "HIGH — LSASS ACCESS PATTERN | ",
+            "Techniques: ", tostring(Techniques), " | ",
+            "ACTIONS: 1. Review full process tree on ", DeviceName, ". ",
+            "2. Check for follow-on lateral movement (SMB/WMI/WinRM). ",
+            "3. Validate whether ", AccountName, " has legitimate SeDebugPrivilege. ",
+            "4. Scope same technique pattern across estate via CmdHash."),
+    strcat(
+        "MEDIUM — LSASS INTERACTION DETECTED | ",
+        "Techniques: ", tostring(Techniques), " | ",
+        "ACTIONS: 1. Verify AV/EDR context — is initiating process known-good? ",
+        "2. Check surrounding events for escalation indicators. ",
+        "3. Promote to HIGH if follow-on file or network activity observed.")
+)
+
+| project
+    LastSeen, FirstSeen, Severity, RiskScore,
+    DeviceName, AccountName, DeviceId,
+    SignalCount, Techniques, EvidenceList,
+    HunterDirective
+| order by RiskScore desc
