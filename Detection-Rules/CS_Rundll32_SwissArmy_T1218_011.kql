@@ -1,0 +1,367 @@
+// ============================================================================
+// COMPOSITE SENSOR: Rundll32 Swiss Army — Multi-Category Proxy Execution
+// ============================================================================
+// Architecture  : Composite Sensor (Architecture 1) — Production Alert
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting
+// Lifecycle     : Production-Candidate (ADX validation pending — Atomic Red Team Docker)
+// MITRE         : T1218.011 Signed Binary Proxy Execution: Rundll32
+//                 TA0005 Defense Evasion · TA0002 Execution
+//
+// WHY THIS IS A COMPOSITE AND NOT A ROUTER RULE:
+// Single binary surface: rundll32.exe only.
+// The 13 categories are NOT different noise domains — they are different
+// attack patterns on the same binary, all sharing the same suppression model:
+//   known-good parent (LegitParents allowlist) +
+//   known-good command (LegitRundll32CmdAllow) +
+//   prevalence suppression (CommandPrevalence)
+// This suppression is safe to apply across ALL 13 categories because the
+// noise source is always the same: legitimate Windows rundll32 invocations.
+// Multiple attack categories on one binary = composite. Not a router rule.
+//
+// FIXES APPLIED vs ORIGINAL (Docs 16/17/18):
+// [FIX-SCHEMA]     TimeGenerated → Timestamp throughout (MDE Advanced Hunting)
+// [FIX-7]          All iff(Flag_X, 1, 0) → iff(Flag_X == true, 1, 0)
+//                  and iff(NetNear, 1, 0) → iff(NetNear == true, 1, 0)
+// [FIX-JOINS]      Used Doc 18 optimised pre-summarise join pattern
+//                  (avoids 1:N join explosion on raw tables)
+// [FIX-PREFLGHT]   Full MTDF pre-flight declaration added
+// [FIX-DIRECTIVE]  HunterDirective restructured — MTDF format, before project
+// [FIX-COUSIN]     Three cousin sensors identified
+// [FIX-LIFECYCLE]  Lifecycle state and patch notes in header
+// [FIX-DUPE]       Docs 16/17 were identical — consolidated into one rule
+//                  using Doc 18 optimised join structure as the base
+// ============================================================================
+
+// ── PRE-FLIGHT DECLARATION ──────────────────────────────────────────────────
+// Technique    : T1218.011 Signed Binary Proxy Execution — Rundll32
+// Strategy     : Substrate-First then Intent categorisation
+//                rundll32 itself is the substrate; flag pattern identifies intent
+// Skeleton     : A — Substrate-First, MDE Advanced Hunting
+// Minimum Truth: rundll32.exe executing with a known-abuse flag pattern
+//                that is NOT in the legitimate command allowlist
+// Threshold    : FinalScore >= 55 (LOW excluded, MEDIUM/HIGH/CRITICAL retained)
+// Min Fire Path: Category BaseScore (min 35) + RarityScore (min 6) = 41 — LOW
+//                Category BaseScore 55+ = MEDIUM without reinforcement
+//                Category 85 (LSASS/Script) = HIGH immediately
+//
+// COUSIN SENSORS (build next):
+//   1. T1218.010 regsvr32 Squiblydoo Composite (same exec surface, different binary)
+//   2. T1218.005 mshta.exe Proxy Composite (HTA proxy exec, different noise)
+//   3. T1003.001 LSASS Dump via comsvcs Composite (when LSASS_Dump_via_comsvcs fires)
+// ────────────────────────────────────────────────────────────────────────────
+
+let lookback = 7d;
+
+// ── ALLOWLISTS — known-good rundll32 invocations ────────────────────────────
+let LegitParents = dynamic([
+    "explorer.exe","svchost.exe","services.exe",
+    "winlogon.exe","userinit.exe","dwm.exe"
+]);
+let OfficeParents = dynamic([
+    "winword.exe","excel.exe","powerpnt.exe","outlook.exe"
+]);
+let ScriptParents = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe","wscript.exe",
+    "cscript.exe","mshta.exe","wmic.exe","wmiprvse.exe"
+]);
+// Known legitimate rundll32 command lines — hard allowlist
+// These are safe to hard-exclude because they are structurally incapable
+// of executing attacker-controlled code
+let LegitRundll32CmdAllow = dynamic([
+    "rundll32.exe shell32.dll,control_rundll",
+    "rundll32.exe shell32.dll,control_rundll desk.cpl",
+    "rundll32.exe shell32.dll,control_rundll main.cpl",
+    "rundll32.exe user32.dll,lockworkstation",
+    "rundll32.exe printui.dll,printuientry"
+]);
+
+// ── ABUSE INDICATORS ────────────────────────────────────────────────────────
+let AbusedDlls = dynamic([
+    "comsvcs.dll","advpack.dll","ieadvpack.dll","syssetup.dll",
+    "setupapi.dll","pcwutl.dll","dfshim.dll","url.dll",
+    "shdocvw.dll","mshtml.dll","scrobj.dll","crypt32.dll","shell32.dll"
+]);
+let SuspiciousDirs = dynamic([
+    "\\windows\\temp\\","\\users\\public\\",
+    "\\appdata\\local\\temp\\","\\programdata\\"
+]);
+let SuspiciousExts = dynamic([
+    ".sct",".vbs",".js",".jse",".vbe",".inf",".ins",".isp"
+]);
+
+// ── PHASE 1: MINIMUM TRUTH ──────────────────────────────────────────────────
+// WHY THIS IS THE MINIMUM TRUTH:
+// rundll32.exe executing anything NOT in the legitimate command allowlist
+// and matching a known-abuse flag pattern. The allowlist is conservative
+// and structurally correct — these command forms cannot execute arbitrary code.
+let RundllExecutions =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName =~ "rundll32.exe"
+| extend CommandLine  = tostring(ProcessCommandLine)
+| extend CommandLower = tolower(CommandLine)
+| extend ParentProcess = tostring(InitiatingProcessFileName)
+| extend ParentLower   = tolower(ParentProcess)
+// Hard allowlist — these are structurally safe
+| where not(CommandLower has_any (LegitRundll32CmdAllow))
+
+// ── PHASE 2: FLAG DETECTION ──────────────────────────────────────────────────
+// Detect which abuse category applies — each flag is a known-bad pattern
+| extend
+    Flag_ScriptProtocol = CommandLower has_any (
+        "javascript:","vbscript:","mshtml,runhtmlapplication","mshtml.dll","scrobj.dll"),
+    Flag_Ordinal        = CommandLine matches regex @",\s*#[0-9]+",
+    Flag_Remote         = (CommandLower startswith "\\\\")
+                          or (CommandLower has_any ("http://","https://","ftp://")),
+    Flag_AbusedDll      = CommandLower has_any (AbusedDlls),
+    Flag_LsassDump      = CommandLower has_any ("comsvcs","minidump"),
+    Flag_InfInstall     = CommandLower has_any (
+        "advpack","ieadvpack","syssetup","setupapi",
+        "registerocx","launchinfsection","setupinfobjectinstallaction"),
+    Flag_ControlNotCpl  = (CommandLower has "control_rundll")
+                          and (CommandLower !has ".cpl"),
+    Flag_EnvVar         = CommandLine matches regex
+                          @"%\w+%.*(\.dll|\.cpl|\.sct|\.js|\.vbs)",
+    Flag_PathObfus      = (CommandLower has "progra~1")
+                          or (CommandLower has "windows~1")
+                          or (CommandLine matches regex @"rundll32\.exe.*\.\.\\"),
+    Flag_DoubleExt      = (CommandLine matches regex
+                          @"\.(pdf|doc|docx|jpg|png|txt)\.(dll|exe)"),
+    Flag_SuspDir        = CommandLower has_any (SuspiciousDirs),
+    Flag_SuspExt        = CommandLower has_any (SuspiciousExts),
+    Flag_BadParent      = (ParentLower !in~ (LegitParents))
+                          and (ParentLower in~ (OfficeParents)
+                               or ParentLower in~ (ScriptParents)
+                               or ParentLower in~ (
+                                "chrome.exe","msedge.exe","firefox.exe",
+                                "w3wp.exe","sqlservr.exe"))
+
+// ── CATEGORY CLASSIFICATION ─────────────────────────────────────────────────
+| extend Category = case(
+    Flag_ScriptProtocol, "Script_Protocol_Handler_Abuse",
+    Flag_LsassDump,      "LSASS_Dump_via_comsvcs",
+    Flag_InfInstall,     "INF_Install_ProxyExec",
+    Flag_Remote,         "Remote_WebDAV_UNC_Load",
+    Flag_Ordinal,        "Ordinal_Execution_Obfuscation",
+    Flag_ControlNotCpl,  "Control_RunDLL_Misuse",
+    Flag_AbusedDll,      "Known_Abused_DLL_ProxyExec",
+    Flag_DoubleExt,      "Double_Extension_Masquerade",
+    Flag_EnvVar,         "EnvVar_Obfuscation",
+    Flag_PathObfus,      "Path_Obfuscation",
+    Flag_SuspExt,        "Suspicious_Script_Extension",
+    Flag_SuspDir,        "Suspicious_Directory_Context",
+    Flag_BadParent,      "Anomalous_Parentage",
+    "Other"
+)
+| where Category != "Other"
+// Normalise command for prevalence fingerprinting
+| extend CmdNorm = replace_regex(replace_regex(replace_regex(
+    CommandLower,
+    @"[0-9a-f]{8}\-[0-9a-f]{4}\-[0-9a-f]{4}\-[0-9a-f]{4}\-[0-9a-f]{12}", "<guid>"),
+    @"0x[0-9a-f]{6,16}", "<hex>"),
+    @"\b\d{4,}\b", "<num>")
+| extend CmdHash = hash_sha256(CmdNorm)
+| project
+    Timestamp, DeviceId,
+    DeviceName    = tolower(DeviceName),
+    AccountName,
+    ParentProcess, ParentCmd = tostring(InitiatingProcessCommandLine),
+    CommandLine, Category, CmdHash,
+    Flag_ScriptProtocol, Flag_Ordinal, Flag_Remote, Flag_AbusedDll,
+    Flag_LsassDump, Flag_InfInstall, Flag_ControlNotCpl, Flag_EnvVar,
+    Flag_PathObfus, Flag_DoubleExt, Flag_BadParent, Flag_SuspDir, Flag_SuspExt;
+
+// ── PHASE 2: NATIVE ENRICHMENT — PRE-SUMMARISED JOINS ───────────────────────
+// [FIX-JOIN] Doc 18 optimised pattern — pre-summarise before joining
+// Prevents 1:N join explosion on raw telemetry tables
+
+// Prevalence fingerprint — how many devices have this exact command form
+let CommandPrevalence =
+RundllExecutions
+| summarize CmdPrevalence = dcount(DeviceId) by CmdHash;
+
+// Network context — pre-summarised to one row per device
+// [FIX-JOIN] Small table joins small table — no raw join on DeviceNetworkEvents
+let NetworkContext =
+DeviceNetworkEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName =~ "rundll32.exe"
+| where RemoteIP !startswith "127." and RemoteIP != "::1"
+| project DeviceId, NetTime = Timestamp, RemoteIP, RemotePort
+| summarize NetNearList = make_list(
+    pack("Time", NetTime, "IP", RemoteIP, "Port", RemotePort)) by DeviceId;
+
+// DLL drops near rundll32 execution
+let DllDrops =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| where FileName endswith ".dll" or FileName endswith ".exe"
+| where tolower(FolderPath) has_any (SuspiciousDirs)
+| project DeviceId, FileTime = Timestamp,
+          DroppedDll = strcat(FolderPath,"\\",FileName)
+| summarize DllNearList = make_list(
+    pack("Time", FileTime, "File", DroppedDll)) by DeviceId;
+
+// Child shell cascade — rundll32 spawning cmd/powershell
+let ChildShells =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where InitiatingProcessFileName =~ "rundll32.exe"
+| where FileName in~ ("cmd.exe","powershell.exe","pwsh.exe")
+| project DeviceId, ChildTime = Timestamp,
+          ChildProcess = FileName, ChildCmd = ProcessCommandLine
+| summarize ChildNearList = make_list(
+    pack("Time", ChildTime, "Proc", ChildProcess, "Cmd", ChildCmd)) by DeviceId;
+
+// ── PHASE 2 JOIN ─────────────────────────────────────────────────────────────
+// [FIX-6] Proximity calculated via mv-apply AFTER join — never filter on right-side
+RundllExecutions
+| join kind=leftouter CommandPrevalence on CmdHash
+| extend CmdPrevalence = coalesce(CmdPrevalence, 1)
+| join kind=leftouter NetworkContext on DeviceId
+| join kind=leftouter DllDrops on DeviceId
+| join kind=leftouter ChildShells on DeviceId
+
+// Calculate proximity windows — mv-apply pattern (Doc 18 optimised)
+| mv-apply NetEntry = NetNearList to typeof(dynamic) on (
+    where abs(datetime_diff("minute", Timestamp, todatetime(NetEntry.Time))) <= 5
+    | summarize NetNear = take_any(true), NetIP = take_any(tostring(NetEntry.IP)),
+                NetPort = take_any(tostring(NetEntry.Port))
+)
+| mv-apply DllEntry = DllNearList to typeof(dynamic) on (
+    where abs(datetime_diff("minute", Timestamp, todatetime(DllEntry.Time))) <= 10
+    | summarize DllNear = take_any(true), DllFile = take_any(tostring(DllEntry.File))
+)
+| mv-apply ChildEntry = ChildNearList to typeof(dynamic) on (
+    where abs(datetime_diff("minute", Timestamp, todatetime(ChildEntry.Time))) <= 5
+    | summarize ChildShellNear = take_any(true),
+                ChildProc = take_any(tostring(ChildEntry.Proc)),
+                ChildCmd  = take_any(tostring(ChildEntry.Cmd))
+)
+| extend
+    NetNear        = coalesce(NetNear, false),
+    DllNear        = coalesce(DllNear, false),
+    ChildShellNear = coalesce(ChildShellNear, false)
+
+// ── PHASE 3: CONVERGENCE SCORING ────────────────────────────────────────────
+// SCORING DECISION TABLE:
+// ┌───────────────────────────────┬────────┬─────────────────────────────────┐
+// │ Signal                        │ Points │ Rationale                       │
+// ├───────────────────────────────┼────────┼─────────────────────────────────┤
+// │ Script_Protocol_Handler_Abuse │   85   │ javascript:/vbscript: = CRIT    │
+// │ LSASS_Dump_via_comsvcs        │   85   │ comsvcs+MiniDump = CRIT         │
+// │ INF_Install_ProxyExec         │   75   │ advpack/launchINF = HIGH        │
+// │ Remote_WebDAV_UNC_Load        │   70   │ Remote DLL load = HIGH          │
+// │ Control_RunDLL_Misuse         │   65   │ control_rundll non-CPL = HIGH   │
+// │ Ordinal_Execution_Obfuscation │   60   │ #ordinal export = elevated      │
+// │ Known_Abused_DLL_ProxyExec    │   55   │ Known-bad DLL = elevated        │
+// │ Double_Extension_Masquerade   │   55   │ .doc.dll = masquerade           │
+// │ Suspicious_Script_Extension   │   55   │ .sct/.vbs load = elevated       │
+// │ EnvVar_Obfuscation            │   45   │ %VAR% path obfuscation          │
+// │ Path_Obfuscation              │   45   │ progra~1 path obfuscation       │
+// │ Anomalous_Parentage           │   45   │ Office/script parent            │
+// │ Suspicious_Directory_Context  │   35   │ Writable path DLL load          │
+// ├───────────────────────────────┼────────┼─────────────────────────────────┤
+// │ Reinforcement: Flag_BadParent │  +20   │ Office/script spawn confirmed   │
+// │ Reinforcement: NetNear        │  +15   │ Network near execution = C2     │
+// │ Reinforcement: DllNear        │  +15   │ DLL staged near execution       │
+// │ Reinforcement: ChildShellNear │  +30   │ cmd/ps child = exec confirmed   │
+// │ Reinforcement: Flag_SuspDir   │  +10   │ Writable path context           │
+// │ Reinforcement: Flag_SuspExt   │  +10   │ Script ext in command           │
+// ├───────────────────────────────┼────────┼─────────────────────────────────┤
+// │ Rarity: CmdPrevalence <= 1    │  +20   │ First-seen command on estate    │
+// │ Rarity: CmdPrevalence <= 3    │  +12   │ Very rare command               │
+// │ Rarity: CmdPrevalence <= 10   │   +6   │ Uncommon command                │
+// │ Rarity: CmdPrevalence > 10    │   -8   │ Common command — down-score     │
+// └───────────────────────────────┴────────┴─────────────────────────────────┘
+
+| extend BaseScore = case(
+    Category == "Script_Protocol_Handler_Abuse", 85,
+    Category == "LSASS_Dump_via_comsvcs",        85,
+    Category == "INF_Install_ProxyExec",         75,
+    Category == "Remote_WebDAV_UNC_Load",        70,
+    Category == "Control_RunDLL_Misuse",         65,
+    Category == "Ordinal_Execution_Obfuscation", 60,
+    Category == "Known_Abused_DLL_ProxyExec",    55,
+    Category == "Double_Extension_Masquerade",   55,
+    Category == "Suspicious_Script_Extension",   55,
+    Category == "EnvVar_Obfuscation",            45,
+    Category == "Path_Obfuscation",              45,
+    Category == "Anomalous_Parentage",           45,
+    Category == "Suspicious_Directory_Context",  35,
+    30
+),
+// [FIX-7] Explicit iff(flag == true/1, ...) throughout
+ContextScore =
+    (20 * iff(Flag_BadParent == true, 1, 0))
+  + (15 * iff(NetNear == true, 1, 0))
+  + (15 * iff(DllNear == true, 1, 0))
+  + (30 * iff(ChildShellNear == true, 1, 0))
+  + (10 * iff(Flag_SuspDir == true, 1, 0))
+  + (10 * iff(Flag_SuspExt == true, 1, 0)),
+RarityScore = case(
+    CmdPrevalence <= 1,  20,
+    CmdPrevalence <= 3,  12,
+    CmdPrevalence <= 10,  6,
+    -8
+)
+| extend FinalScore = tolong(BaseScore + ContextScore + RarityScore)
+| extend Severity = case(
+    FinalScore >= 95, "CRITICAL",
+    FinalScore >= 75, "HIGH",
+    FinalScore >= 55, "MEDIUM",
+    "LOW"
+)
+// Production gate — exclude LOW severity
+| where Severity != "LOW"
+// Reinforcement gate — lower-confidence categories require corroboration
+| where
+    Category in (
+        "Script_Protocol_Handler_Abuse","LSASS_Dump_via_comsvcs",
+        "INF_Install_ProxyExec","Remote_WebDAV_UNC_Load")
+    or (Category in (
+        "Control_RunDLL_Misuse","Ordinal_Execution_Obfuscation",
+        "Known_Abused_DLL_ProxyExec","Double_Extension_Masquerade",
+        "Suspicious_Script_Extension")
+        and (NetNear or DllNear or Flag_BadParent or ChildShellNear))
+    or (Category in (
+        "EnvVar_Obfuscation","Path_Obfuscation",
+        "Suspicious_Directory_Context","Anomalous_Parentage")
+        and (NetNear or DllNear or ChildShellNear)
+        and CmdPrevalence <= 3)
+
+// ── PHASE 4: HUNTER DIRECTIVE ───────────────────────────────────────────────
+// MUST be defined BEFORE project statement
+| extend HunterDirective = strcat(
+    "COMPOSITE | T1218.011 Rundll32 | Category=", Category,
+    " | Score=", tostring(FinalScore), " | Severity=", Severity,
+    " | Rarity=", tostring(CmdPrevalence), " devices",
+    " | Parent=", ParentProcess,
+    " | CMD=", substring(CommandLine, 0, min(strlen(CommandLine), 240)),
+    iff(ChildShellNear,
+        strcat(" | ⚠ CHILD SHELL: ", ChildProc, " | ", substring(ChildCmd, 0, 120)), ""),
+    iff(NetNear,
+        strcat(" | ⚠ NETWORK: ", NetIP, ":", NetPort), ""),
+    iff(DllNear,
+        strcat(" | ⚠ DLL STAGED: ", DllFile), ""),
+    " | NEXT: ",
+    case(
+        Severity == "CRITICAL",
+            "ISOLATE if unapproved. Verify DLL origin/signature. Scope for persistence + credential access. Capture memory for JS/comsvcs cases.",
+        Severity == "HIGH",
+            "Pivot CmdHash estate-wide. Check child processes, network, and DLL staging. Validate if user action was expected.",
+        "Baseline host and user. Promote if follow-on execution, repeated CmdHash, or reinforcement appears."
+    )
+)
+
+| project
+    Timestamp, DeviceName, AccountName, Category,
+    ParentProcess, ParentCmd, CommandLine,
+    ChildShellNear, ChildProc, ChildCmd,
+    NetNear, NetIP, NetPort,
+    DllNear, DllFile,
+    CmdPrevalence, FinalScore, Severity,
+    HunterDirective
+| order by FinalScore desc, Timestamp desc
