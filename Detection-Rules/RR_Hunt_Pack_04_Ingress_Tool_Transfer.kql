@@ -1,0 +1,147 @@
+// ============================================================================
+// ROUTER RULE: Ingress Tool Transfer — Evasion-Aware (Hunt Pack 04/10)
+// ============================================================================
+// Architecture  : Router Rule (Architecture 2) — Triage Surface
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle     : Router (Temporary)
+// MITRE         : T1197 · T1140 · T1105 · T1059.001 · T1036
+//
+// WHY THIS IS A ROUTER RULE:
+// Seven LOLBin downloaders — seven different enterprise noise profiles.
+// bitsadmin.exe = SCCM / Windows Update / Intune noise.
+// certutil.exe  = PKI operations / developer certificate tooling noise.
+// curl.exe      = DevOps CI/CD pipelines / REST API testing noise.
+// powershell.exe = Everything in enterprise — extreme noise.
+// One suppression model cannot cover all without creating blind spots.
+// This rule surfaces ingress transfer intent and routes analysts to the
+// correct dedicated composite sensor per technique.
+//
+// FIXES vs ORIGINAL Hunt Pack 04:
+// [FIX-1]         any(ProcessCommandLine) → arg_max(Timestamp, *)
+//                 Original any() is non-deterministic — SampleCLI may not
+//                 reflect the event that produced MaxRisk score.
+// [FIX-7]         All iif(bool, x, 0) → iff(flag == 1, x, 0)
+//                 Explicit int comparison required for consistent scoring.
+// [FIX-8]         IsMasqueraded, HasScript, BadParent, IsStagingPath
+//                 all converted to toint() — boolean flags must be typed.
+// [FIX-CIRCULAR]  HasNet removed from scoring entirely.
+//                 Original scored +60 for HasNet which duplicated the Phase 1
+//                 filter — every survivor had HasNet=true so 60 points were
+//                 silently awarded to 100% of events. Meaningless.
+// [FIX-DEADCODE]  WeirdExport = bool(false), IsPersistence = bool(false),
+//                 IsDownloader = HasNet removed — dead variables adding noise.
+// [FIX-BURST]     where not(Count > 20 and MaxRisk < 70) removed.
+//                 Hard burst suppression creates a blind spot: 21 bitsadmin
+//                 downloads at score 69 are MORE suspicious than 1, not less.
+//                 Replaced with soft IsManagedParent down-score penalty.
+// [FIX-THRESHOLD] RiskScore >= 50 → >= 30
+//                 50 is too high for a router rule triage surface.
+//                 Router threshold is always <= 30 per MTDF doctrine.
+// [FIX-BASE]      Base starts at 0 — router rule doctrine.
+//                 Original had implicit base inflation via circular HasNet scoring.
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬──────────────────────────────┬─────────────────────┐
+// │ Technique            │ Composite Status              │ Action              │
+// ├──────────────────────┼──────────────────────────────┼─────────────────────┤
+// │ bitsadmin /transfer  │ T1197 Composite — BUILT ✅    │ RETIRE from router  │
+// │ certutil -urlcache   │ T1140 Composite — pending 🔴  │ Keep in router      │
+// │ curl / wget -o       │ No composite yet              │ Keep in router      │
+// │ ftp / tftp transfer  │ No composite planned          │ Keep in router      │
+// │ PowerShell cradle    │ T1059.001 — BUILT ✅          │ RETIRE from router  │
+// │ IsMasqueraded signal │ T1036 Masquerade — pending 🔴 │ Keep in router      │
+// └──────────────────────┴──────────────────────────────┴─────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let TargetProcs = dynamic([
+    "certutil.exe","bitsadmin.exe","curl.exe","wget.exe",
+    "ftp.exe","tftp.exe","powershell.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","winword.exe","excel.exe","outlook.exe",
+    "wscript.exe","cscript.exe","mshta.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+let ManagedParents = dynamic([
+    "ccmexec.exe","intunemanagementextension.exe","wuauclt.exe","svchost.exe"
+]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "-urlcache","-split","-f","decode",
+    "/transfer","/addfile","/setnotifycmdline","/resume",
+    " -o "," --output "," -OutFile ","--remote-name",
+    "invoke-webrequest","iwr","invoke-restmethod","irm",
+    "downloadstring","new-object net.webclient"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] toint() on all boolean flags
+| extend
+    IsMasqueraded   = toint(HasOrig and FileLower != OrigLower),
+    HasScript       = toint(ProcessCommandLine has_any (
+                        "downloadstring","iex","-enc","frombase64string")),
+    BadDLLPath      = toint(ProcessCommandLine has ".dll"
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    BadParent       = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    IsStagingPath   = toint(ProcessCommandLine has_any (SuspiciousDirs)),
+    IsManagedParent = toint(InitiatingProcessFileName in~ (ManagedParents))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+// [FIX-CIRCULAR] HasNet NOT scored — duplicates Phase 1 filter
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)
+    + iff(HasScript == 1,       25, 0)
+    + iff(BadDLLPath == 1,      20, 0)
+    + iff(BadParent == 1,       15, 0)
+    + iff(IsStagingPath == 1,   10, 0)
+    - iff(IsManagedParent == 1, 15, 0)
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed LOLBin confirmed",
+    FileLower =~ "bitsadmin.exe",
+        "HIGH → T1197 BITSAdmin Composite | Composite built — run it",
+    FileLower =~ "certutil.exe",
+        "HIGH → T1140 Certutil Composite | Composite pending — investigate",
+    FileLower in~ ("curl.exe","wget.exe"),
+        "HIGH → No composite yet | Engineer T1105 curl/wget composite",
+    HasScript == 1,
+        "HIGH → T1059.001 PowerShell Composite | Composite built — run it",
+    FileLower in~ ("ftp.exe","tftp.exe"),
+        "MEDIUM → No composite | Legacy transfer — investigate manually",
+    "MEDIUM → Ingress transfer intent | Route to appropriate composite"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, HasScript, BadParent,
+    IsStagingPath, RoutingDirective
+| sort by RiskScore desc
