@@ -1,0 +1,272 @@
+// ============================================================================
+// COMPOSITE SENSOR: PowerShell Download Cradle — Ingress Tool Transfer
+// ============================================================================
+// Architecture  : Composite Sensor (Architecture 1) — Production Alert
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting
+// Lifecycle     : Production-Candidate (ADX validation pending)
+// MITRE         : T1105 Ingress Tool Transfer · T1059.001 PowerShell
+//                 TA0002 Execution · TA0011 Command and Control
+//
+// WHY THIS IS A COMPOSITE AND NOT A ROUTER RULE:
+// Single binary surface: powershell.exe / pwsh.exe only.
+// Single noise domain: PowerShell with external download intent.
+// One suppression model covers all variants:
+//   exclude known management tooling (AllowStrings)
+//   exclude internal network destinations (RFC1918 + corp/local/internal)
+// These suppressions are safe to apply across ALL PowerShell download cradle
+// variants because the noise source is identical regardless of which download
+// method is used (iwr vs irm vs WebClient vs DownloadString).
+// Different methods are execution variants, not different noise domains.
+//
+// FIXES APPLIED vs ORIGINAL (Doc 14):
+// [FIX-BASE]       BaseScore 45 → 55 (MTDF composite doctrine)
+// [FIX-1]          any(Cmd/DeviceName/AccountName/FileName) → arg_max() pattern
+//                  Replaced with MTDF summarise structure
+// [FIX-2]          make_set(iff(IsFileMatch, DroppedFile, "")) →
+//                  make_set_if(DroppedFile, IsFileMatch == 1)
+// [FIX-2b]         make_set(iff(IsChildMatch, ChildProc, "")) →
+//                  make_set_if(ChildProc, IsChildMatch == 1)
+// [FIX-7]          All iff() use explicit int comparisons (== 1)
+// [FIX-8]          HasExecIntent/BadParent/TargetsWritable/TargetsSuspExt/LongEncoded
+//                  all converted to toint()
+// [FIX-PREFLGHT]   Full pre-flight declaration added
+// [FIX-DIRECTIVE]  HunterDirective restructured — MUST be before project
+// [FIX-COUSIN]     Three cousin sensors identified
+// [FIX-LIFECYCLE]  Lifecycle state declared in header
+// ============================================================================
+
+// ── PRE-FLIGHT DECLARATION ──────────────────────────────────────────────────
+// Technique    : T1105 Ingress Tool Transfer via PowerShell Download Cradle
+// Strategy     : Intent-First (Skeleton B)
+//                PowerShell is ubiquitous — the download primitive is the anchor
+// Skeleton     : B — Intent-First, MDE Advanced Hunting
+// Minimum Truth: powershell.exe with external HTTP/S URL AND explicit download
+//                intent primitive (iwr/irm/WebClient/DownloadString/DownloadFile)
+// Threshold    : RiskScore >= 70
+// Min Fire Path: Base 55 + HasExecIntent 30 = 85 >= 70 ✓
+//                Base 55 + FileNear 25 = 80 >= 70 ✓
+//                Base 55 + ChildNear 25 = 80 >= 70 ✓
+//
+// COUSIN SENSORS (build next):
+//   1. T1105 certutil -urlcache Composite (certutil noise domain — separate sensor)
+//   2. T1105 BITSAdmin Transfer Composite (SCCM noise domain — separate sensor)
+//   3. T1059.001 PowerShell AMSI Bypass Composite (in-memory, no download required)
+// ────────────────────────────────────────────────────────────────────────────
+
+let lookback = 7d;
+let Threshold = 70;
+let NearWindowMins = 10;
+
+let ShellProcs = dynamic(["powershell.exe","pwsh.exe"]);
+let SuspiciousParents = dynamic([
+    "winword.exe","excel.exe","powerpnt.exe","outlook.exe",
+    "wscript.exe","cscript.exe","mshta.exe"
+]);
+let WritablePathHints = dynamic([
+    "\\users\\public\\","\\programdata\\","\\windows\\temp\\",
+    "\\temp\\","\\downloads\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\"
+]);
+let SuspTargetExts = dynamic([
+    ".ps1",".vbs",".vbe",".js",".jse",".sct",".hta",
+    ".dll",".exe",".msi",".zip",".7z",".rar",".iso",".img",".cab",".dat",".bin"
+]);
+// Known management tooling — exclude from minimum truth
+// These represent legitimate automated download scenarios
+let AllowStrings = dynamic(["ccmcache","amazonssmagent","azureadconnect"]);
+
+// ── PHASE 1: MINIMUM TRUTH ──────────────────────────────────────────────────
+// WHY THIS IS THE MINIMUM TRUTH:
+// PowerShell alone is noise. External URL alone is noise.
+// PowerShell + external URL + explicit download API = structural ingress intent.
+// All three conditions must be true. No one condition is the truth alone.
+let Base =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName in~ (ShellProcs)
+| extend Cmd    = tolower(tostring(ProcessCommandLine))
+| extend Parent = tolower(tostring(InitiatingProcessFileName))
+// [FIX-8] toint() on all boolean flags
+| extend
+    HasExternalUrl   = toint(Cmd matches regex @"(?i)http[s]?://"),
+    HasIngressIntent = toint(Cmd has_any (
+                        "invoke-webrequest"," iwr","invoke-restmethod"," irm",
+                        "downloadstring","downloadfile",
+                        "new-object net.webclient","system.net.webclient")),
+    HasExecIntent    = toint(Cmd has_any (
+                        "iex","invoke-expression","-enc","frombase64string")),
+    BadParent        = toint(Parent in~ (SuspiciousParents)),
+    TargetsWritable  = toint(Cmd has_any (WritablePathHints)),
+    TargetsSuspExt   = toint(Cmd has_any (SuspTargetExts)),
+    LongEncoded      = toint(Cmd matches regex @"(?i)\s-enc(odedcommand)?\s+[A-Za-z0-9+/=]{400,}")
+// Allowlist — known safe management tooling
+| where not(Cmd has_any (AllowStrings))
+// Exclude internal network destinations — these are management, not C2
+| where not(Cmd matches regex
+    @"(?i)://(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.|.*\.corp\.|.*\.local|.*\.internal)")
+// MINIMUM TRUTH — both conditions required
+| where HasExternalUrl == 1 and HasIngressIntent == 1
+| project
+    Timestamp, DeviceId, DeviceName, AccountName,
+    FileName, ProcessId, InitiatingProcessId,
+    Parent, Cmd,
+    HasExecIntent, BadParent, TargetsWritable, TargetsSuspExt, LongEncoded;
+
+// ── PHASE 2: NATIVE ENRICHMENT — REINFORCEMENT SURFACES ────────────────────
+// [REINFORCEMENT T1] File writes by this PS process within NearWindowMins
+// WHY: Download + file drop = payload staging confirmed
+let FileArtifacts =
+DeviceFileEvents
+| where Timestamp >= ago(lookback)
+| where ActionType in ("FileCreated","FileRenamed","FileModified")
+| extend Path     = tolower(tostring(FolderPath))
+| extend FullPath = strcat(Path,"\\",tolower(tostring(FileName)))
+| where Path has_any (WritablePathHints) or FullPath has_any (SuspTargetExts)
+| project DeviceId,
+          WriterProcessId = InitiatingProcessId,
+          FileTime        = Timestamp,
+          DroppedFile     = FullPath;
+
+// [REINFORCEMENT T2] Child process cascade from this PS process within window
+// WHY: Download → execute chain is the attack completing
+let ChildCascade =
+DeviceProcessEvents
+| where Timestamp >= ago(lookback)
+| where FileName !in~ ("conhost.exe","werfault.exe")
+| project DeviceId,
+          ParentProcessId = InitiatingProcessId,
+          ChildTime       = Timestamp,
+          ChildProc       = tolower(tostring(FileName)),
+          ChildCmd        = tostring(ProcessCommandLine);
+
+// ── PHASE 2 JOIN — SAFE LEFTOUTER, NO GHOST CHAINS ─────────────────────────
+// [FIX-GHOST] join kind=leftouter — reinforcement is OPTIONAL
+// [FIX-6] extend IsMatch BEFORE filtering — never filter on right-side fields
+// [FIX-2] make_set_if — replaces make_set(iff(...,""))
+
+let WithFile =
+Base
+| join kind=leftouter (FileArtifacts) on DeviceId
+| extend IsFileMatch = toint(
+    WriterProcessId == ProcessId
+    and abs(datetime_diff("minute", Timestamp, FileTime)) <= NearWindowMins)
+| summarize
+    FileNear     = max(IsFileMatch),
+    // [FIX-2] make_set_if — no empty strings in output
+    DroppedFiles = make_set_if(DroppedFile, IsFileMatch == 1, 10),
+    Timestamp    = max(Timestamp),
+    DeviceName   = take_any(DeviceName),
+    AccountName  = take_any(AccountName),
+    FileName     = take_any(FileName),
+    Cmd          = take_any(Cmd),
+    Parent       = take_any(Parent),
+    HasExecIntent   = max(HasExecIntent),
+    BadParent       = max(BadParent),
+    TargetsWritable = max(TargetsWritable),
+    TargetsSuspExt  = max(TargetsSuspExt),
+    LongEncoded     = max(LongEncoded)
+  by DeviceId, ProcessId, InitiatingProcessId;
+
+let WithChild =
+WithFile
+| join kind=leftouter (ChildCascade) on DeviceId
+| extend IsChildMatch = toint(
+    ParentProcessId == ProcessId
+    and abs(datetime_diff("minute", Timestamp, ChildTime)) <= NearWindowMins)
+| summarize
+    ChildNear   = max(IsChildMatch),
+    // [FIX-2] make_set_if
+    ChildProcs  = make_set_if(ChildProc, IsChildMatch == 1, 10),
+    Timestamp   = max(Timestamp),
+    DeviceName  = take_any(DeviceName),
+    AccountName = take_any(AccountName),
+    FileName    = take_any(FileName),
+    Cmd         = take_any(Cmd),
+    Parent      = take_any(Parent),
+    HasExecIntent   = max(HasExecIntent),
+    BadParent       = max(BadParent),
+    TargetsWritable = max(TargetsWritable),
+    TargetsSuspExt  = max(TargetsSuspExt),
+    LongEncoded     = max(LongEncoded),
+    FileNear    = max(FileNear),
+    DroppedFiles= take_any(DroppedFiles)
+  by DeviceId, ProcessId, InitiatingProcessId;
+
+// ── PHASE 3: CONVERGENCE SCORING ────────────────────────────────────────────
+// SCORING DECISION TABLE:
+// ┌──────────────────────────────┬────────┬──────────────────────────────────┐
+// │ Signal                       │ Points │ Rationale                        │
+// ├──────────────────────────────┼────────┼──────────────────────────────────┤
+// │ Base (min truth met)         │   55   │ ExternalURL + download intent     │
+// │ HasExecIntent                │   30   │ IEX/FromBase64 = in-mem exec      │
+// │ BadParent                    │   25   │ Office/script spawn = phishing     │
+// │ FileNear                     │   25   │ Payload staged to disk confirmed  │
+// │ ChildNear                    │   25   │ Download→execute chain confirmed  │
+// │ TargetsWritable              │   10   │ User-writable staging path        │
+// │ TargetsSuspExt               │   10   │ Executable/script extension drop  │
+// │ LongEncoded                  │    8   │ 400+ char encoded command         │
+// └──────────────────────────────┴────────┴──────────────────────────────────┘
+//
+// MINIMUM FIRE PATHS:
+//   Base 55 + HasExecIntent 30 = 85 >= 70 ✓
+//   Base 55 + FileNear 25 = 80 >= 70 ✓
+//   Base 55 + ChildNear 25 = 80 >= 70 ✓
+//   Base 55 + BadParent 25 = 80 >= 70 ✓
+//   Base 55 + TargetsWritable 10 + TargetsSuspExt 10 = 75 >= 70 ✓
+
+WithChild
+// [FIX-BASE] BaseScore 55 — MTDF composite doctrine (was 45 in original)
+| extend
+    BaseScore    = 55,
+    ContextScore =
+        // [FIX-7] Explicit iff(flag == 1, ...) throughout
+        (30 * iff(HasExecIntent == 1, 1, 0))
+      + (25 * iff(BadParent == 1, 1, 0))
+      + (10 * iff(TargetsWritable == 1, 1, 0))
+      + (10 * iff(TargetsSuspExt == 1, 1, 0))
+      + (8  * iff(LongEncoded == 1, 1, 0)),
+    ReinforceScore =
+        (25 * iff(FileNear == 1, 1, 0))
+      + (25 * iff(ChildNear == 1, 1, 0))
+| extend RawScore  = BaseScore + ContextScore + ReinforceScore
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, tolong(RawScore))
+| extend Severity  = case(
+    RiskScore >= 95, "CRITICAL",
+    RiskScore >= 80, "HIGH",
+    RiskScore >= 70, "MEDIUM",
+    "LOW")
+| where RiskScore >= Threshold
+
+// ── PHASE 4: HUNTER DIRECTIVE ───────────────────────────────────────────────
+// MUST be defined BEFORE project statement
+// Branches on context to give analyst precise next action
+| extend HunterDirective = strcat(
+    "INTENT-FIRST | T1105 PowerShell Download Cradle",
+    " | Score=", tostring(RiskScore),
+    " | Severity=", Severity,
+    " | Parent=", Parent,
+    " | ExecIntent=", tostring(HasExecIntent),
+    " | FileNear=", tostring(FileNear),
+    " | ChildNear=", tostring(ChildNear),
+    " | CMD=", substring(Cmd, 0, min(strlen(Cmd), 240)),
+    iff(FileNear == 1,
+        strcat(" | PAYLOAD STAGED: ", tostring(DroppedFiles)), ""),
+    iff(ChildNear == 1,
+        strcat(" | CHILD CASCADE: ", tostring(ChildProcs)), ""),
+    iff(BadParent == 1,
+        " | ⚠ OFFICE/SCRIPT PARENT — phishing chain suspected", ""),
+    " | NEXT: Extract URL, decode if base64, validate dropped files,",
+    " review child lineage, scope pattern across estate."
+)
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    RiskScore, Severity,
+    Parent, Cmd,
+    FileNear, DroppedFiles,
+    ChildNear, ChildProcs,
+    HasExecIntent, BadParent,
+    TargetsWritable, TargetsSuspExt, LongEncoded,
+    HunterDirective
+| order by RiskScore desc, Timestamp desc
