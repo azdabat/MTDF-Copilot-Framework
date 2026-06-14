@@ -1,0 +1,142 @@
+// ============================================================================
+// ROUTER RULE: AD & Domain Reconnaissance Surface (Hunt Pack 07/10)
+// ============================================================================
+// Architecture  : Router Rule (Architecture 2) — Triage Surface
+// Author        : Ala Dabat | MTDF 2026
+// Platform      : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle     : Router (Temporary)
+// MITRE         : T1087 · T1069 · T1016 · T1033 · T1482 · T1018
+//
+// WHY THIS IS A ROUTER RULE:
+// Three tool families — three incompatible noise domains.
+// dsquery/dsget/nltest = specialist AD admin tools — LOW enterprise noise.
+//   Suppression: exclude known domain admin accounts + scheduled job context.
+// net.exe/net1.exe = used by everything in enterprise — EXTREME noise.
+//   Suppression: exclude service accounts, patch tooling, monitoring agents.
+// whoami/systeminfo = moderate IT script noise.
+//   Suppression: exclude IT automation accounts + build pipelines.
+// Combining all three in a composite would require suppression so broad
+// that excluding net.exe noise blinds detection of dsquery/nltest signals
+// which are far more suspicious in isolation.
+//
+// FIXES vs ORIGINAL Hunt Pack 07:
+// [FIX-1]         any(SampleCLI) → arg_max(Timestamp, *)
+// [FIX-7]         All iff() use explicit int comparisons (== 1)
+// [FIX-8]         IsMasqueraded, IsADTool, IsNetTool, IsHostRecon, HasScript,
+//                 BadParent, BadDLLPath, IsAdminAccount all toint()
+// [FIX-+30]       Hardcoded + 30 mystery boost removed entirely.
+//                 Original added 30 to every single event with no condition.
+//                 This was equivalent to raising base score by 30 globally —
+//                 architecturally wrong. Replaced with IsADTool signal (+30).
+// [FIX-BURST]     where not(Count > 50 and MaxRisk < 70) removed.
+//                 Replaced with IsAdminAccount soft down-score penalty.
+// [FIX-THRESHOLD] >= 50 → >= 30 (correct router threshold)
+// [FIX-DEADCODE]  HasNet=bool(false), IsDownloader=bool(false),
+//                 IsPersistence=bool(false), WeirdExport=bool(false) removed.
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬──────────────────────────────┬─────────────────────┐
+// │ Technique            │ Composite Status              │ Action              │
+// ├──────────────────────┼──────────────────────────────┼─────────────────────┤
+// │ dsquery/dsget/nltest │ T1087/T1482 — pending 🔴      │ Keep in router      │
+// │ net.exe enumeration  │ T1069/T1087 — pending 🔴      │ Keep in router      │
+// │ whoami/systeminfo    │ T1033/T1016 — pending 🔴      │ Keep in router      │
+// └──────────────────────┴──────────────────────────────┴─────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let ADTools = dynamic(["dsquery.exe","dsget.exe","nltest.exe"]);
+let NetTools = dynamic(["net.exe","net1.exe"]);
+let HostReconTools = dynamic(["whoami.exe","systeminfo.exe"]);
+let AllTargetProcs = dynamic([
+    "dsquery.exe","dsget.exe","nltest.exe",
+    "net.exe","net1.exe","whoami.exe","systeminfo.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+let KnownAdminPatterns = dynamic(["sccm","scom","backup","scan","monitor"]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (AllTargetProcs) or (HasOrig and OrigLower in~ (AllTargetProcs))
+| where ProcessCommandLine has_any (
+    "dsquery","dsget","/dclist:","/domain_trusts",
+    "/trusted_domains","/dsgetdc:","-samid","-limit",
+    "user","group","localgroup","accounts","share",
+    "view","/all","/priv","/groups",
+    "systeminfo","-enc","frombase64string","iex"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] toint() on all boolean flags
+| extend
+    IsMasqueraded  = toint(HasOrig and FileLower != OrigLower),
+    IsADTool       = toint(FileLower in~ (ADTools) or OrigLower in~ (ADTools)),
+    IsNetTool      = toint(FileLower in~ (NetTools) or OrigLower in~ (NetTools)),
+    IsHostRecon    = toint(FileLower in~ (HostReconTools)
+                        or OrigLower in~ (HostReconTools)),
+    HasScript      = toint(ProcessCommandLine has_any (
+                        "-enc","frombase64string","iex")),
+    BadParent      = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    BadDLLPath     = toint(ProcessCommandLine has ".dll"
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    IsAdminAccount = toint(AccountName has_any (KnownAdminPatterns))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-+30] Replaced mystery +30 with structured IsADTool signal
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)
+    + iff(IsADTool == 1,        30, 0)
+    + iff(HasScript == 1,       25, 0)
+    + iff(BadParent == 1,       20, 0)
+    + iff(IsNetTool == 1,       10, 0)
+    + iff(IsHostRecon == 1,     10, 0)
+    + iff(BadDLLPath == 1,      15, 0)
+    - iff(IsAdminAccount == 1,  20, 0)
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed recon tool confirmed",
+    IsADTool == 1 and BadParent == 1,
+        "HIGH → T1087/T1482 AD Recon | Specialist tool from shell/Office parent",
+    IsADTool == 1,
+        "HIGH → T1087/T1482 AD Recon | dsquery/nltest execution — investigate",
+    IsNetTool == 1 and BadParent == 1,
+        "HIGH → T1069/T1087 Net Enum | Net command from suspicious parent",
+    IsNetTool == 1,
+        "MEDIUM → T1069/T1087 Net Enum | Net command — baseline required",
+    IsHostRecon == 1 and BadParent == 1,
+        "MEDIUM → T1033/T1016 Host Recon | whoami/systeminfo from script parent",
+    "MEDIUM → Discovery surface | Investigate context and parent"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, IsADTool, IsNetTool,
+    IsHostRecon, HasScript, BadParent, RoutingDirective
+| sort by RiskScore desc
